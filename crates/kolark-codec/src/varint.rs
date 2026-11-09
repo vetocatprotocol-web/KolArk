@@ -144,7 +144,42 @@ pub fn svarint_len(value: i64) -> usize {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use std::io::Cursor;
+    use std::io::{Cursor, Read, Write};
+
+    struct ShortReader {
+        cursor: Cursor<Vec<u8>>,
+        max_read: usize,
+    }
+
+    impl Read for ShortReader {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let length = buffer.len().min(self.max_read);
+            self.cursor.read(&mut buffer[..length])
+        }
+    }
+
+    struct FailingReader;
+
+    impl Read for FailingReader {
+        fn read(&mut self, _: &mut [u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::other("reader failed"))
+        }
+    }
+
+    struct FailingWriter;
+
+    impl Write for FailingWriter {
+        fn write(&mut self, _: &[u8]) -> std::io::Result<usize> {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::BrokenPipe,
+                "writer failed",
+            ))
+        }
+
+        fn flush(&mut self) -> std::io::Result<()> {
+            Ok(())
+        }
+    }
 
     #[test]
     fn test_varint_basic() {
@@ -172,6 +207,56 @@ mod tests {
             let decoded = read_varint(&mut cursor).unwrap();
             assert_eq!(decoded, value, "read_varint({})", value);
         }
+    }
+
+    #[test]
+    fn test_reader_handles_short_reads_and_concatenated_values() {
+        let values = [0, 127, 128, u32::MAX as u64, u64::MAX];
+        let mut bytes = Vec::new();
+        for value in values {
+            write_varint(&mut bytes, value).unwrap();
+        }
+        bytes.push(0x5a);
+
+        let mut reader = ShortReader {
+            cursor: Cursor::new(bytes),
+            max_read: 1,
+        };
+        for value in values {
+            assert_eq!(read_varint(&mut reader).unwrap(), value);
+        }
+        let mut sentinel = [0];
+        reader.read_exact(&mut sentinel).unwrap();
+        assert_eq!(sentinel, [0x5a]);
+    }
+
+    #[test]
+    fn test_reader_does_not_consume_bytes_after_varint() {
+        let mut reader = Cursor::new([0xac, 0x02, 0x7f]);
+        assert_eq!(read_varint(&mut reader).unwrap(), 300);
+        assert_eq!(reader.position(), 2);
+        assert_eq!(read_varint(&mut reader).unwrap(), 127);
+        assert_eq!(reader.position(), 3);
+    }
+
+    #[test]
+    fn test_reader_io_errors_are_not_reported_as_truncation() {
+        assert_eq!(
+            read_varint(&mut FailingReader),
+            Err(VarintError::Io("reader failed".to_owned()))
+        );
+    }
+
+    #[test]
+    fn test_writer_io_errors_are_propagated() {
+        assert_eq!(
+            write_varint(&mut FailingWriter, 1),
+            Err(VarintError::Io("writer failed".to_owned()))
+        );
+        assert_eq!(
+            write_svarint(&mut FailingWriter, -1),
+            Err(VarintError::Io("writer failed".to_owned()))
+        );
     }
 
     #[test]
