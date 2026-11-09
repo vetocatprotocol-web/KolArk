@@ -1,15 +1,16 @@
 //! Archive writer
 
 use kolark_codec::blake3::Blake3Hasher;
+use kolark_codec::cdc::StreamingCdcSplitter;
 use kolark_codec::varint::{write_svarint as write_svarint_raw, write_varint as write_varint_raw};
-use kolark_codec::{blake3_hash, cdc_split, lz_compress, CdcConfig};
+use kolark_codec::{blake3_hash, lz_compress, CdcConfig};
 use kolark_format::{
     ChunkIndex, ChunkIndexEntry, ChunkRecord, Column, ColumnCodec, ColumnEncoding, Footer,
     FormatError, FormatResult, Header, Superblock, CHUNK_FLAG_LZ, CHUNK_FLAG_RAW,
 };
 use std::collections::HashMap;
 use std::fs::File;
-use std::io::{Seek, Write};
+use std::io::{Read, Seek, Write};
 
 fn write_varint<W: Write>(writer: &mut W, value: u64) -> FormatResult<()> {
     write_varint_raw(writer, value).map_err(|error| FormatError::InvalidVarint(error.to_string()))
@@ -80,59 +81,79 @@ impl ChunkStore {
         }
     }
 
-    fn add_chunk(&mut self, data: &[u8], config: &CdcConfig) -> FormatResult<Vec<u32>> {
-        let chunks = cdc_split(data, *config);
+    fn add_reader<R: Read>(
+        &mut self,
+        reader: &mut R,
+        config: CdcConfig,
+    ) -> FormatResult<(Vec<u32>, [u8; 32], u64)> {
         let mut refs = Vec::new();
+        let mut splitter = StreamingCdcSplitter::new(config);
+        let mut file_hasher = Blake3Hasher::new();
+        let mut file_size = 0u64;
+        let mut buffer = [0u8; 64 * 1024];
 
-        for chunk in chunks {
-            let hash = blake3_hash(&chunk.data);
-            let size_original = checked_u32_len(chunk.data.len(), "chunk size")?;
-
-            // Check for existing chunk with same hash
-            let mut found = false;
-            if let Some(indices) = self.hash_to_record.get(&hash) {
-                for &idx in indices {
-                    if self.raw_chunks[idx] == chunk.data {
-                        refs.push(idx as u32);
-                        found = true;
-                        break;
-                    }
-                }
+        loop {
+            let bytes_read = reader.read(&mut buffer)?;
+            if bytes_read == 0 {
+                break;
             }
-
-            if !found {
-                // Compress with LZ
-                let compressed = lz_compress(&chunk.data);
-                let compressed_len = compressed.len();
-                let flags = if compressed_len < chunk.data.len() {
-                    CHUNK_FLAG_LZ
-                } else {
-                    CHUNK_FLAG_RAW
-                };
-
-                let (final_data, final_size) = if flags == CHUNK_FLAG_LZ {
-                    (compressed, compressed_len)
-                } else {
-                    (chunk.data.clone(), chunk.data.len())
-                };
-
-                let record = ChunkRecord {
-                    hash,
-                    size_compressed: checked_u32_len(final_size, "compressed chunk size")?,
-                    size_original,
-                    flags,
-                    data: final_data,
-                };
-
-                let idx = self.records.len();
-                self.records.push(record);
-                self.raw_chunks.push(chunk.data);
-                self.hash_to_record.entry(hash).or_default().push(idx);
-                refs.push(idx as u32);
+            file_size = file_size
+                .checked_add(bytes_read as u64)
+                .ok_or_else(|| FormatError::IntegerOverflow("input file size".to_string()))?;
+            file_hasher.update(&buffer[..bytes_read]);
+            for chunk in splitter.process(&buffer[..bytes_read]) {
+                refs.push(self.add_chunk(&chunk.data)?);
             }
         }
 
-        Ok(refs)
+        if let Some(chunk) = splitter.finalize() {
+            refs.push(self.add_chunk(&chunk.data)?);
+        }
+
+        Ok((refs, file_hasher.finalize(), file_size))
+    }
+
+    fn add_chunk(&mut self, data: &[u8]) -> FormatResult<u32> {
+        let hash = blake3_hash(data);
+        let size_original = checked_u32_len(data.len(), "chunk size")?;
+
+        if let Some(indices) = self.hash_to_record.get(&hash) {
+            for &index in indices {
+                if self.raw_chunks[index] == data {
+                    return u32::try_from(index).map_err(|_| {
+                        FormatError::ResourceLimitExceeded("too many chunks".to_string())
+                    });
+                }
+            }
+        }
+
+        let compressed = lz_compress(data);
+        let compressed_size = compressed.len();
+        let flags = if compressed_size < data.len() {
+            CHUNK_FLAG_LZ
+        } else {
+            CHUNK_FLAG_RAW
+        };
+        let (stored_data, stored_size) = if flags == CHUNK_FLAG_LZ {
+            (compressed, compressed_size)
+        } else {
+            (data.to_vec(), data.len())
+        };
+
+        let record = ChunkRecord {
+            hash,
+            size_compressed: checked_u32_len(stored_size, "compressed chunk size")?,
+            size_original,
+            flags,
+            data: stored_data,
+        };
+        let index = self.records.len();
+        let reference = u32::try_from(index)
+            .map_err(|_| FormatError::ResourceLimitExceeded("too many chunks".to_string()))?;
+        self.records.push(record);
+        self.raw_chunks.push(data.to_vec());
+        self.hash_to_record.entry(hash).or_default().push(index);
+        Ok(reference)
     }
 
     fn write<W: Write + Seek>(&self, writer: &mut W) -> FormatResult<u64> {
@@ -282,8 +303,6 @@ pub fn create_archive<W: Write + Seek>(
             )));
         }
         let mut file = File::open(&input.path)?;
-        let mut file_data = Vec::new();
-        std::io::Read::read_to_end(&mut file, &mut file_data)?;
 
         let mtime = match input.mtime {
             Some(mtime) => mtime,
@@ -303,7 +322,7 @@ pub fn create_archive<W: Write + Seek>(
             }
         };
 
-        let mode = input.mode.unwrap_or_else(|| {
+        let mode = input.mode.unwrap_or({
             #[cfg(unix)]
             {
                 use std::os::unix::fs::MetadataExt;
@@ -320,17 +339,13 @@ pub fn create_archive<W: Write + Seek>(
             )));
         }
 
-        // Compute content hash
-        let content_hash = blake3_hash(&file_data);
-
-        // Split into chunks and add to store
-        let chunk_refs = chunk_store.add_chunk(&file_data, &config)?;
+        let (chunk_refs, content_hash, size) = chunk_store.add_reader(&mut file, config)?;
 
         file_metadata.push(FileMeta {
             path,
             mtime,
             mode,
-            size: file_data.len() as u64,
+            size,
             content_hash,
             chunk_refs,
         });
@@ -661,7 +676,92 @@ fn build_chunk_index(chunk_store: &ChunkStore) -> FormatResult<(ChunkIndex, Vec<
 mod tests {
     use super::*;
     use crate::{open_archive, ReaderOptions, VerifyLevel};
-    use std::io::Cursor;
+    use std::io::{Cursor, Read};
+
+    struct ShortReader<'a> {
+        data: &'a [u8],
+        max_read: usize,
+    }
+
+    impl Read for ShortReader<'_> {
+        fn read(&mut self, buffer: &mut [u8]) -> std::io::Result<usize> {
+            let count = buffer.len().min(self.max_read).min(self.data.len());
+            buffer[..count].copy_from_slice(&self.data[..count]);
+            self.data = &self.data[count..];
+            Ok(count)
+        }
+    }
+
+    #[test]
+    fn streaming_chunk_store_matches_batch_cdc_across_short_reads() {
+        let data: Vec<u8> = (0usize..4096)
+            .map(|index| (index.wrapping_mul(73) % 251) as u8)
+            .collect();
+        let config = CdcConfig::new(32, 64, 128).unwrap();
+        let mut reader = ShortReader {
+            data: &data,
+            max_read: 7,
+        };
+        let mut store = ChunkStore::new();
+        let (references, content_hash, size) = store.add_reader(&mut reader, config).unwrap();
+        let expected = kolark_codec::cdc::cdc_split(&data, config);
+
+        assert_eq!(
+            references.len(),
+            expected.len(),
+            "streaming refs={}, expected chunks={}, input size={size}",
+            references.len(),
+            expected.len()
+        );
+        assert_eq!(content_hash, blake3_hash(&data));
+        assert_eq!(size, data.len() as u64);
+        for (reference, expected_chunk) in references.iter().zip(&expected) {
+            assert_eq!(store.raw_chunks[*reference as usize], expected_chunk.data);
+        }
+
+        let mut duplicate_reader = ShortReader {
+            data: &data,
+            max_read: 13,
+        };
+        let (duplicate_references, duplicate_hash, duplicate_size) =
+            store.add_reader(&mut duplicate_reader, config).unwrap();
+        assert_eq!(duplicate_hash, content_hash);
+        assert_eq!(duplicate_size, size);
+        assert_eq!(duplicate_references, references);
+        let unique_chunks = expected
+            .iter()
+            .map(|chunk| chunk.data.as_slice())
+            .collect::<std::collections::HashSet<_>>();
+        assert_eq!(store.records.len(), unique_chunks.len());
+    }
+
+    #[test]
+    fn archive_writer_reads_large_inputs_incrementally() {
+        let current_dir = std::env::current_dir().unwrap();
+        let temp_dir = tempfile::Builder::new()
+            .prefix("kolark-core-streaming-writer-")
+            .tempdir_in(&current_dir)
+            .unwrap();
+        let relative_dir = temp_dir.path().strip_prefix(&current_dir).unwrap();
+        let data: Vec<u8> = (0usize..192 * 1024)
+            .map(|index| (index.wrapping_mul(73).wrapping_add(index / 97) % 251) as u8)
+            .collect();
+        std::fs::write(temp_dir.path().join("large.bin"), &data).unwrap();
+
+        let input = InputEntry {
+            path: relative_dir.join("large.bin"),
+            ..InputEntry::default()
+        };
+        let mut archive = Cursor::new(Vec::new());
+        let summary = create_archive(&mut archive, &[input], &CreateOptions::default()).unwrap();
+        assert_eq!(summary.file_count, 1);
+
+        let mut reader =
+            open_archive(Cursor::new(archive.into_inner()), &ReaderOptions::default()).unwrap();
+        assert_eq!(reader.entries()[0].size, data.len() as u64);
+        assert_eq!(reader.entries()[0].content_hash, blake3_hash(&data));
+        assert!(reader.verify(VerifyLevel::Full).unwrap().valid);
+    }
 
     #[test]
     fn archive_round_trip_is_canonical_and_deduplicates() {
@@ -728,7 +828,10 @@ mod tests {
         let data = b"KolArk archive round-trip test data with repeated content. ".repeat(20);
         let config = CdcConfig::new(16, 32, 64).unwrap();
         let mut store = ChunkStore::new();
-        let references = store.add_chunk(&data, &config).unwrap();
+        let mut cursor = std::io::Cursor::new(&data);
+        let (references, content_hash, size) = store.add_reader(&mut cursor, config).unwrap();
+        assert_eq!(content_hash, blake3_hash(&data));
+        assert_eq!(size, data.len() as u64);
         let (_, discovery_to_index) = build_chunk_index(&store).unwrap();
         let final_references = references
             .iter()

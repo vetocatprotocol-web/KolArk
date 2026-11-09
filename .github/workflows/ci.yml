@@ -52,9 +52,9 @@ jobs:
           RUSTDOCFLAGS: -D warnings
         run: cargo doc --workspace --no-deps --locked
 
-      - name: Run benchmark smoke test
+      - name: Run benchmark suite
         if: runner.os == 'Linux'
-        run: cargo run --release --locked -p kolark-bench -- --iterations 1 --size-mib 1 > benchmark-report.json
+        run: cargo run --release --locked -p kolark-bench -- --iterations 3 --size-mib 4 > benchmark-report.json
 
       - name: Upload benchmark report
         if: runner.os == 'Linux'
@@ -63,7 +63,7 @@ jobs:
           name: kolark-benchmark-${{ runner.os }}-${{ github.sha }}
           path: benchmark-report.json
           if-no-files-found: error
-          retention-days: 14
+          retention-days: 30
 
   dependency-audit:
     name: Dependency audit

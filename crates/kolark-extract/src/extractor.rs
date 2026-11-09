@@ -1,7 +1,7 @@
 //! Safe extraction
 
 use kolark_codec::blake3_hash;
-use kolark_core::{ArchiveEntry, ArchiveReader};
+use kolark_core::{ArchiveEntry, ArchiveReader, VerifyLevel};
 use kolark_format::FormatError;
 use std::fs;
 use std::io::Write;
@@ -61,12 +61,17 @@ pub fn extract_all<R: std::io::Read + std::io::Seek>(
             "extraction output exceeds byte limit".to_string(),
         ));
     }
+    reader.verify(VerifyLevel::Full)?;
+
     let destination = if options.dry_run {
         destination.to_path_buf()
     } else {
         fs::create_dir_all(destination)?;
         fs::canonicalize(destination)?
     };
+    if !options.dry_run {
+        preflight_destinations(&entries, &destination, options)?;
+    }
 
     let mut report = ExtractReport {
         file_count: 0,
@@ -86,14 +91,83 @@ pub fn extract_all<R: std::io::Read + std::io::Seek>(
     Ok(report)
 }
 
-fn extract_file<R: std::io::Read + std::io::Seek>(
-    reader: &mut ArchiveReader<R>,
-    entry: &ArchiveEntry,
+fn preflight_destinations(
+    entries: &[ArchiveEntry],
     destination: &Path,
     options: &ExtractOptions,
-) -> Result<bool, FormatError> {
-    let path = entry
-        .path
+) -> Result<(), FormatError> {
+    let mut destinations = std::collections::HashSet::new();
+    let mut required_directories = std::collections::HashSet::new();
+    for entry in entries {
+        let components = validated_components(&entry.path)?;
+        let remaining = components
+            .iter()
+            .skip(options.strip_components)
+            .copied()
+            .collect::<Vec<_>>();
+        let Some((filename, parents)) = remaining.split_last() else {
+            continue;
+        };
+        let normalized = remaining.join("/").to_lowercase();
+        let mut parent_key = String::new();
+        for component in parents {
+            if !parent_key.is_empty() {
+                parent_key.push('/');
+            }
+            parent_key.push_str(&component.to_lowercase());
+            if destinations.contains(&parent_key) {
+                return Err(FormatError::PathCollision(format!(
+                    "file path is also an extraction directory: {}",
+                    entry.path.display()
+                )));
+            }
+            required_directories.insert(parent_key.clone());
+        }
+        if required_directories.contains(&normalized) || !destinations.insert(normalized) {
+            return Err(FormatError::PathCollision(format!(
+                "multiple archive entries map to the same extraction path: {}",
+                entry.path.display()
+            )));
+        }
+
+        let mut parent = destination.to_path_buf();
+        for component in parents {
+            parent.push(component);
+            match fs::symlink_metadata(&parent) {
+                Ok(metadata) if metadata.file_type().is_symlink() || !metadata.is_dir() => {
+                    return Err(FormatError::InvalidPath(format!(
+                        "unsafe extraction directory: {}",
+                        parent.display()
+                    )));
+                }
+                Ok(_) => {}
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => break,
+                Err(error) => return Err(error.into()),
+            }
+        }
+
+        let target = parent.join(filename);
+        match fs::symlink_metadata(&target) {
+            Ok(metadata) if metadata.file_type().is_symlink() => {
+                return Err(FormatError::InvalidPath(format!(
+                    "refusing to overwrite symlink: {}",
+                    target.display()
+                )));
+            }
+            Ok(metadata) if !metadata.is_file() => {
+                return Err(FormatError::DestinationExists(target.display().to_string()));
+            }
+            Ok(_) if options.overwrite => {}
+            Ok(_) => {}
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => return Err(error.into()),
+        }
+    }
+    Ok(())
+}
+
+fn validated_components(path: &Path) -> Result<Vec<&str>, FormatError> {
+    let path = path
         .to_str()
         .ok_or_else(|| FormatError::InvalidPath("path is not valid UTF-8".to_string()))?;
     let components: Vec<&str> = path.split('/').collect();
@@ -104,14 +178,22 @@ fn extract_file<R: std::io::Read + std::io::Seek>(
         || path.contains('\0')
         || components
             .iter()
-            .any(|part| part.is_empty() || *part == "." || *part == "..")
-        || components.first().is_some_and(|part| part.contains(':'))
+            .any(|part| part.is_empty() || *part == "." || *part == ".." || part.contains(':'))
     {
         return Err(FormatError::InvalidPath(format!(
             "unsafe archive path: {path}"
         )));
     }
+    Ok(components)
+}
 
+fn extract_file<R: std::io::Read + std::io::Seek>(
+    reader: &mut ArchiveReader<R>,
+    entry: &ArchiveEntry,
+    destination: &Path,
+    options: &ExtractOptions,
+) -> Result<bool, FormatError> {
+    let components = validated_components(&entry.path)?;
     let data = reconstruct_file(reader, entry)?;
     let computed_hash = blake3_hash(&data);
     if computed_hash != entry.content_hash {
@@ -165,6 +247,7 @@ fn extract_file<R: std::io::Read + std::io::Seek>(
                 target_path.display().to_string(),
             ));
         }
+        Ok(_) if options.overwrite => {}
         Ok(_) => {
             return Err(FormatError::DestinationExists(
                 target_path.display().to_string(),
@@ -370,5 +453,120 @@ mod tests {
         );
         assert!(matches!(result, Err(FormatError::ResourceLimitExceeded(_))));
         assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn integrity_failure_is_detected_before_destination_creation() {
+        let current_dir = std::env::current_dir().unwrap();
+        let source_dir = tempfile::Builder::new()
+            .prefix("kolark-extract-integrity-")
+            .tempdir_in(&current_dir)
+            .unwrap();
+        let relative_dir = source_dir.path().strip_prefix(&current_dir).unwrap();
+        let mut state = 0x4b4f_4c41_524b_7631u64;
+        let mut contents = Vec::with_capacity(4096);
+        for _ in 0..4096 {
+            state =
+                state.wrapping_add(0x9e37_79b9_7f4a_7c15).rotate_left(17) ^ 0xbf58_476d_1ce4_e5b9;
+            contents.push((state >> 24) as u8);
+        }
+        std::fs::write(source_dir.path().join("payload.bin"), &contents).unwrap();
+
+        let mut archive = Cursor::new(Vec::new());
+        create_archive(
+            &mut archive,
+            &[InputEntry {
+                path: relative_dir.join("payload.bin"),
+                ..InputEntry::default()
+            }],
+            &CreateOptions::default(),
+        )
+        .unwrap();
+        let mut bytes = archive.into_inner();
+        assert_eq!(bytes[88], kolark_format::CHUNK_FLAG_RAW);
+        bytes[89] ^= 0x80;
+        let footer_start = bytes.len() - kolark_format::footer::FOOTER_SIZE as usize;
+        let hash_all = kolark_codec::blake3_hash(&bytes[..footer_start]);
+        bytes[footer_start + 32..footer_start + 64].copy_from_slice(&hash_all);
+
+        let destination_root = tempfile::tempdir().unwrap();
+        let destination = destination_root.path().join("must-not-be-created");
+        let mut reader = open_archive(Cursor::new(bytes), &ReaderOptions::default()).unwrap();
+        let result = extract_all(&mut reader, &destination, &ExtractOptions::default());
+
+        assert!(matches!(result, Err(FormatError::HashMismatch { .. })));
+        assert!(!destination.exists());
+    }
+
+    #[test]
+    fn preflight_rejects_file_directory_path_collisions() {
+        let destination = tempfile::tempdir().unwrap();
+        let entries = [
+            ArchiveEntry {
+                path: "node".into(),
+                size: 0,
+                mtime: 0,
+                mode: 0,
+                content_hash: [0; 32],
+                chunk_refs: Vec::new(),
+            },
+            ArchiveEntry {
+                path: "node/child".into(),
+                size: 0,
+                mtime: 0,
+                mode: 0,
+                content_hash: [0; 32],
+                chunk_refs: Vec::new(),
+            },
+        ];
+
+        let result =
+            preflight_destinations(&entries, destination.path(), &ExtractOptions::default());
+
+        assert!(matches!(result, Err(FormatError::PathCollision(_))));
+        assert_eq!(std::fs::read_dir(destination.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn overwrite_replaces_existing_regular_file() {
+        let current_dir = std::env::current_dir().unwrap();
+        let source_dir = tempfile::Builder::new()
+            .prefix("kolark-extract-overwrite-")
+            .tempdir_in(&current_dir)
+            .unwrap();
+        let relative_dir = source_dir.path().strip_prefix(&current_dir).unwrap();
+        let contents = b"new contents";
+        std::fs::write(source_dir.path().join("payload.bin"), contents).unwrap();
+        let mut archive = Cursor::new(Vec::new());
+        create_archive(
+            &mut archive,
+            &[InputEntry {
+                path: relative_dir.join("payload.bin"),
+                ..InputEntry::default()
+            }],
+            &CreateOptions::default(),
+        )
+        .unwrap();
+
+        let destination = tempfile::tempdir().unwrap();
+        let relative_target = relative_dir.join("payload.bin");
+        let target = destination.path().join(&relative_target);
+        std::fs::create_dir_all(target.parent().unwrap()).unwrap();
+        std::fs::write(&target, b"old contents").unwrap();
+
+        let mut reader =
+            open_archive(Cursor::new(archive.into_inner()), &ReaderOptions::default()).unwrap();
+        let report = extract_all(
+            &mut reader,
+            destination.path(),
+            &ExtractOptions {
+                overwrite: true,
+                ..ExtractOptions::default()
+            },
+        )
+        .unwrap();
+
+        assert_eq!(report.file_count, 1);
+        assert_eq!(std::fs::read(target).unwrap(), contents);
     }
 }

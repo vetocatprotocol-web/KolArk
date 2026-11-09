@@ -25,7 +25,9 @@ Format v1 menetapkan output canonical: input dan opsi yang sama harus menghasilk
 
 Workspace Rust memiliki lima crate: `kolark-format`, `kolark-codec`, `kolark-core`, `kolark-extract`, dan `kolark-cli`. Implementasi mencakup serialisasi format, varint/Zigzag, BLAKE3, Gear CDC, KolArk-LZ, penulisan/pembacaan arsip, verifikasi, serta ekstraksi dan perintah CLI utama.
 
-CLI dapat dibangun dan digunakan untuk pekerjaan dasar, tetapi bukan pengganti suite konformansi. `test-vector` menjalankan pemeriksaan codec bawaan; fixture arsip konformansi tidak dibundel. Ekstraksi juga belum menjamin perlindungan race filesystem tingkat produksi. Status KolArk v1 conforming dan kesiapan produksi belum terbukti.
+CLI dapat dibangun dan digunakan untuk pekerjaan dasar, tetapi bukan pengganti suite konformansi. `test-vector` menjalankan pemeriksaan codec bawaan; fixture arsip konformansi tidak dibundel. Ekstraksi memverifikasi integritas arsip penuh dan melakukan pemeriksaan konflik tujuan sebelum menulis file, tetapi belum menjamin perlindungan race filesystem tingkat produksi. Status KolArk v1 conforming dan kesiapan produksi belum terbukti.
+
+Writer memproses input secara streaming dengan buffer baca tetap dan splitter CDC, sehingga tidak lagi memuat keseluruhan file input ke buffer per-file. Namun, chunk unik dan representasi kompresinya tetap disimpan di memori sampai arsip ditulis; penggunaan memori total belum dibatasi independen dari ukuran arsip.
 
 ## Cakupan Format v1
 
@@ -35,7 +37,7 @@ V1 dirancang untuk:
 - Membagi file menjadi chunk menggunakan Gear Hash CDC dan menduplikasi konten yang identik.
 - Mengompres chunk dan kolom metadata menggunakan KolArk-LZ sesuai aturan canonical.
 - Memvalidasi struktur, offset, ukuran, referensi, dan hash sebelum atau selama pembacaan.
-- Mengekstrak file dengan validasi path dan pemeriksaan symlink; perlindungan race filesystem masih memerlukan penyelesaian.
+- Mengekstrak file setelah verifikasi integritas penuh, dengan validasi path, preflight konflik tujuan, dan pemeriksaan symlink; perlindungan race filesystem masih memerlukan penyelesaian.
 
 V1 tidak menyediakan enkripsi, tanda tangan digital, autentikasi penerbit, symbolic link, hardlink sebagai entri, special file, ACL, extended attributes, atau metadata owner/group. Hash tanpa kunci mendeteksi perubahan data, tetapi **tidak** membuktikan siapa pembuat arsip. Arsip yang diubah beserta hash-nya dapat dihitung ulang oleh pihak lain.
 
@@ -108,7 +110,7 @@ Harness mengeluarkan laporan JSON untuk empat workload sintetis: banyak file kec
 
 ## Continuous Integration
 
-Workflow GitHub Actions di `.github/workflows/ci.yml` berjalan pada push, pull request, dan pemicu manual. Format check, Clippy, seluruh unit/integration tests, build release CLI, dan kompilasi dokumentasi Rust dijalankan pada Linux, macOS, dan Windows. Dependency audit berjalan terpisah, sementara benchmark smoke test dijalankan sekali pada Linux dan laporan JSON disimpan sebagai artifact.
+Workflow GitHub Actions di `.github/workflows/ci.yml` berjalan pada push, pull request, dan pemicu manual. Format check, Clippy, seluruh unit/integration tests, build release CLI, dan kompilasi dokumentasi Rust dijalankan pada Linux, macOS, dan Windows. Dependency audit berjalan terpisah, sementara benchmark suite tiga iterasi (file besar 4 MiB) dijalankan sekali pada Linux dan laporan JSON disimpan sebagai artifact selama 30 hari.
 
 Workflow ini belum menjalankan golden/conformance vectors, interop Rust/Python, atau fuzz smoke tests karena fixture lintas implementasi dan harness fuzz belum tersedia. Kelulusan CI tidak menyatakan format v1 conforming atau produk siap produksi.
 

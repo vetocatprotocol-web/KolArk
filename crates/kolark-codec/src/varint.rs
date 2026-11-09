@@ -40,7 +40,7 @@ pub fn read_varint<R: Read>(reader: &mut R) -> Result<u64, VarintError> {
         }
     }
 
-    Err(VarintError::Overflow)
+    read_varint_from_slice(&bytes).map(|(value, _)| value)
 }
 
 pub(crate) fn read_varint_from_slice(data: &[u8]) -> Result<(u64, usize), VarintError> {
@@ -48,8 +48,13 @@ pub(crate) fn read_varint_from_slice(data: &[u8]) -> Result<(u64, usize), Varint
 
     for index in 0..MAX_VARINT_LEN {
         let byte = *data.get(index).ok_or(VarintError::Truncated)?;
-        if index == MAX_VARINT_LEN - 1 && byte > 1 {
-            return Err(VarintError::Overflow);
+        if index == MAX_VARINT_LEN - 1 {
+            if byte & 0x80 != 0 {
+                return Err(VarintError::InvalidContinuation);
+            }
+            if byte > 1 {
+                return Err(VarintError::Overflow);
+            }
         }
 
         result |= ((byte & 0x7f) as u64) << (index * 7);
@@ -233,7 +238,7 @@ mod tests {
 
     #[test]
     fn test_varint_overflow_on_tenth_byte() {
-        for final_byte in [0x02, 0x7f, 0x80, 0x81, 0xff] {
+        for final_byte in [0x02, 0x7f] {
             let mut bytes = [0x80; MAX_VARINT_LEN];
             bytes[MAX_VARINT_LEN - 1] = final_byte;
             assert_eq!(
@@ -245,9 +250,42 @@ mod tests {
     }
 
     #[test]
-    fn test_varint_continuation_on_tenth_byte_is_overflow() {
-        let mut cursor = Cursor::new([0x80; 10]);
-        assert_eq!(read_varint(&mut cursor), Err(VarintError::Overflow));
+    fn test_varint_continuation_on_tenth_byte_is_rejected() {
+        let mut bytes = [0x80; MAX_VARINT_LEN];
+        bytes[MAX_VARINT_LEN - 1] = 0x80;
+        assert_eq!(
+            read_varint(&mut Cursor::new(bytes)),
+            Err(VarintError::InvalidContinuation)
+        );
+        assert_eq!(
+            read_varint_from_slice(&bytes),
+            Err(VarintError::InvalidContinuation)
+        );
+    }
+
+    #[test]
+    fn test_every_tenth_byte_obeys_u64_bounds() {
+        for final_byte in 0..=u8::MAX {
+            let mut bytes = [0x80; MAX_VARINT_LEN];
+            bytes[MAX_VARINT_LEN - 1] = final_byte;
+            let expected = match final_byte {
+                0 => Err(VarintError::NonMinimal),
+                1 => Ok(1u64 << 63),
+                2..=0x7f => Err(VarintError::Overflow),
+                0x80..=u8::MAX => Err(VarintError::InvalidContinuation),
+            };
+
+            assert_eq!(
+                read_varint_from_slice(&bytes).map(|(value, _)| value),
+                expected,
+                "slice decoder for tenth byte 0x{final_byte:02x}"
+            );
+            assert_eq!(
+                read_varint(&mut Cursor::new(bytes)),
+                expected,
+                "reader decoder for tenth byte 0x{final_byte:02x}"
+            );
+        }
     }
 
     #[test]
@@ -255,7 +293,10 @@ mod tests {
         // 11 bytes all with continuation bit
         let buf = vec![0x80; 11];
         let mut cursor = Cursor::new(buf);
-        assert_eq!(read_varint(&mut cursor), Err(VarintError::Overflow));
+        assert_eq!(
+            read_varint(&mut cursor),
+            Err(VarintError::InvalidContinuation)
+        );
     }
 
     #[test]
@@ -302,6 +343,35 @@ mod tests {
                 "decode_zigzag({})",
                 unsigned
             );
+        }
+    }
+
+    #[test]
+    fn test_svarint_canonical_encodings_and_lengths() {
+        let test_cases = [
+            (0i64, vec![0x00]),
+            (1, vec![0x02]),
+            (-1, vec![0x01]),
+            (63, vec![0x7e]),
+            (-64, vec![0x7f]),
+            (64, vec![0x80, 0x01]),
+            (-65, vec![0x81, 0x01]),
+            (
+                i64::MAX,
+                vec![0xfe, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01],
+            ),
+            (
+                i64::MIN,
+                vec![0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0xff, 0x01],
+            ),
+        ];
+
+        for (value, expected) in test_cases {
+            let mut encoded = Vec::new();
+            write_svarint(&mut encoded, value).unwrap();
+            assert_eq!(encoded, expected, "canonical encoding for {value}");
+            assert_eq!(svarint_len(value), expected.len());
+            assert_eq!(read_svarint(&mut Cursor::new(expected)).unwrap(), value);
         }
     }
 
