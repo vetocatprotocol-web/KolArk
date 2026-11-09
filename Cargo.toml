@@ -1,0 +1,39 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/kolark-format",
+    "crates/kolark-codec",
+    "crates/kolark-core",
+    "crates/kolark-extract",
+    "crates/kolark-cli",
+    "crates/kolark-bench",
+]
+exclude = [
+    "test-vectors",
+    "fuzz",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+license = "MIT OR Apache-2.0"
+authors = ["KolArk Contributors"]
+repository = "https://github.com/KolArk/kolark"
+
+[workspace.dependencies]
+blake3 = { version = "1.5", features = [] }
+thiserror = "1.0"
+byteorder = "1.5"
+tempfile = "3.8"
+walkdir = "2.3"
+clap = { version = "4.5", features = ["derive"] }
+serde = { version = "1.0", features = ["derive"] }
+serde_json = "1.0"
+anyhow = "1.0"
+crc32fast = "1.4"
+hex = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+strip = true
